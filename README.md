@@ -1,51 +1,74 @@
-# Infra K8s — Fase 4 Tech Challenge FIAP
+# Infra K8s (LOCAL) — Fase 4 Tech Challenge FIAP
 
-Terraform que provisiona a **infraestrutura Kubernetes** compartilhada pelos 3 microsserviços:
+Branch **`local`** — orquestra o ambiente de desenvolvimento em Kubernetes local via [k3d](https://k3d.io/) (K3s rodando em Docker). Zero custo, roda offline.
 
-- **VPC** dedicada (`10.30.0.0/16`) com 2 subnets públicas em AZs distintas
-- **Amazon EKS** v1.30 com managed node group (2× t3.small)
-- **NGINX Ingress Controller** (via Helm, expõe NLB internet-facing)
-- **RabbitMQ** self-hosted no cluster (Helm chart bitnami, namespace `messaging`)
-- **MongoDB** self-hosted (Helm chart bitnami, namespace `data`, standalone)
+Para infra AWS (EKS + Helm charts), veja a branch [`aws`](../../tree/aws).
 
-RDS Postgres fica no repo separado [`fiap-fase4-infra-db`](https://github.com/arthurfcs98/fiap-fase4-infra-db).
+## O que sobe
 
-## Estratégia
+| Componente | Namespace | Como | Imagem |
+|---|---|---|---|
+| PostgreSQL 16 | `data` | StatefulSet + PVC | `postgres:16-alpine` (oficial) |
+| MongoDB 7 | `data` | StatefulSet + PVC | `mongo:7` (oficial) |
+| RabbitMQ 3.13 + management UI | `messaging` | StatefulSet + PVC | `rabbitmq:3.13-management-alpine` (oficial) |
+| OS Service (2 réplicas + HPA) | `oficina` | Deployment | build local via `docker build` |
+| Billing Service (2 réplicas + HPA) | `oficina` | Deployment | build local |
+| Execution Service (2 réplicas + HPA) | `oficina` | Deployment | build local |
 
-- Blitz mode AWS Academy: `terraform apply` → gravação vídeo → `terraform destroy` (mesmo padrão da Fase 3, ~$15-20/dia)
-- Ingress único NLB atende os 3 serviços (`/os`, `/billing`, `/execution`)
-- Broker (RabbitMQ) e NoSQL (Mongo) rodam no próprio cluster — economiza recurso AWS e mostra "microsserviço mesh completo" no vídeo
-- Postgres fica gerenciado (RDS) porque atende requisito de "banco relacional" com backup automático
+Ingress via Traefik (default do k3d) → hosts `os.localhost`, `billing.localhost`, `execution.localhost`, `rabbitmq.localhost` na porta `8081`.
 
-## Rodando
+## Setup completo em 1 comando
 
 ```bash
-cd terraform
-export AWS_PROFILE=fiap  # STS Academy
-terraform init
-terraform apply
+./k3d/setup.sh
 ```
 
-Depois:
+Faz tudo: cria o cluster, aplica infra, builda as imagens dos 3 serviços, importa no cluster e aplica os manifestos. Termina imprimindo os endpoints.
+
+**Pré-requisitos:**
 ```bash
-aws eks update-kubeconfig --name fiap-fase4-eks --region us-east-1
-kubectl apply -f ../../fiap-fase4-os-service/k8s/
-kubectl apply -f ../../fiap-fase4-billing-service/k8s/
-kubectl apply -f ../../fiap-fase4-execution-service/k8s/
+brew install k3d helm kubectl docker
 ```
 
-## Destroy
-
-Ordem reversa das dependências (mesmo padrão Fase 3):
+**Antes de rodar:** adiciona os hosts locais em `/etc/hosts`:
 ```bash
-cd ~/dev/fiap-fase4/fiap-fase4-infra-db/terraform && terraform destroy -auto-approve
-cd ~/dev/fiap-fase4/fiap-fase4-infra-k8s/terraform && terraform destroy -auto-approve
+echo "127.0.0.1 os.localhost billing.localhost execution.localhost rabbitmq.localhost" | sudo tee -a /etc/hosts
 ```
 
-## CI/CD
+E cria `../.env` na raiz do monorepo (ou nesse repo) com as creds do Mercado Pago:
+```
+MERCADO_PAGO_ACCESS_TOKEN=APP_USR-...
+MERCADO_PAGO_PUBLIC_KEY=APP_USR-...
+```
 
-`.github/workflows/terraform.yml` — fmt + init + validate + plan em PR, apply em push na main. STS creds via GitHub Secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`).
+## Comandos úteis
 
-## Backend
+```bash
+# Reset total do cluster
+./k3d/setup.sh --clean
 
-State: `s3://fiap-fase4-tfstate/infra-k8s/terraform.tfstate` com lock via DynamoDB `fiap-fase4-tflock`. Bucket e tabela devem ser criados uma vez antes do primeiro apply (via CloudFormation/manual/script auxiliar).
+# Re-deploy dos apps sem rebuildar
+./k3d/setup.sh --skip-build
+
+# Ver todos os pods
+kubectl get pods -A
+
+# Logs de um serviço
+kubectl logs -n oficina -l app=os-service -f
+
+# Escalar manualmente (o HPA vai devolver pra 2-5)
+kubectl scale deployment/os-service -n oficina --replicas=4
+
+# Ver HPA em ação
+kubectl get hpa -n oficina -w
+
+# Deletar cluster
+k3d cluster delete fiap-fase4
+```
+
+## Repositórios relacionados (Fase 4)
+
+- [fiap-fase4-os-service](https://github.com/arthurfcs98/fiap-fase4-os-service) (branch `local`)
+- [fiap-fase4-billing-service](https://github.com/arthurfcs98/fiap-fase4-billing-service) (branch `local`)
+- [fiap-fase4-execution-service](https://github.com/arthurfcs98/fiap-fase4-execution-service) (branch `local`)
+- [fiap-fase4-infra-db](https://github.com/arthurfcs98/fiap-fase4-infra-db) (branch `local` = docker apenas, sem RDS)
