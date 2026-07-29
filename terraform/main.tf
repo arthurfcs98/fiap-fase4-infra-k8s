@@ -5,17 +5,17 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.100"
     }
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.16"
-    }
     kubernetes = {
       source  = "hashicorp/kubernetes"
       version = "~> 2.32"
     }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.16"
+    }
   }
   backend "s3" {
-    bucket         = "fiap-fase4-tfstate"
+    bucket         = "fiap-fase4-tfstate-004025521107"
     key            = "infra-k8s/terraform.tfstate"
     region         = "us-east-1"
     dynamodb_table = "fiap-fase4-tflock"
@@ -28,6 +28,7 @@ provider "aws" {
 }
 
 data "aws_caller_identity" "current" {}
+data "aws_availability_zones" "available" { state = "available" }
 
 # ============================================================================
 # VPC
@@ -51,8 +52,8 @@ resource "aws_subnet" "public" {
   availability_zone       = data.aws_availability_zones.available.names[count.index]
   map_public_ip_on_launch = true
   tags = {
-    Name                            = "fiap-fase4-public-${count.index}"
-    "kubernetes.io/role/elb"        = "1"
+    Name                                        = "fiap-fase4-public-${count.index}"
+    "kubernetes.io/role/elb"                    = "1"
     "kubernetes.io/cluster/${var.cluster_name}" = "shared"
   }
 }
@@ -72,19 +73,11 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
 # ============================================================================
 # EKS
 # ============================================================================
-data "aws_iam_roles" "eks_cluster" {
-  name_regex = "LabEksClusterRole.*"
-}
-data "aws_iam_roles" "eks_node" {
-  name_regex = "LabEksNodeRole.*"
-}
+data "aws_iam_roles" "eks_cluster" { name_regex = "LabEksClusterRole.*" }
+data "aws_iam_roles" "eks_node"    { name_regex = "LabEksNodeRole.*" }
 
 resource "aws_eks_cluster" "main" {
   name     = var.cluster_name
@@ -120,10 +113,16 @@ resource "aws_eks_node_group" "main" {
 }
 
 # ============================================================================
-# NGINX Ingress via Helm
+# Providers Kubernetes + Helm
 # ============================================================================
 data "aws_eks_cluster_auth" "main" {
   name = aws_eks_cluster.main.name
+}
+
+provider "kubernetes" {
+  host                   = aws_eks_cluster.main.endpoint
+  cluster_ca_certificate = base64decode(aws_eks_cluster.main.certificate_authority[0].data)
+  token                  = data.aws_eks_cluster_auth.main.token
 }
 
 provider "helm" {
@@ -134,79 +133,71 @@ provider "helm" {
   }
 }
 
-provider "kubernetes" {
-  host                   = aws_eks_cluster.main.endpoint
-  cluster_ca_certificate = base64decode(aws_eks_cluster.main.certificate_authority[0].data)
-  token                  = data.aws_eks_cluster_auth.main.token
-}
-
+# ============================================================================
+# NGINX Ingress (Helm — chart mainstream, sem IRSA)
+# ============================================================================
 resource "helm_release" "nginx_ingress" {
-  depends_on = [aws_eks_node_group.main]
-  name       = "ingress-nginx"
-  namespace  = "ingress-nginx"
+  depends_on       = [aws_eks_node_group.main]
+  name             = "ingress-nginx"
+  namespace        = "ingress-nginx"
   create_namespace = true
-  repository = "https://kubernetes.github.io/ingress-nginx"
-  chart      = "ingress-nginx"
-  version    = "4.11.3"
+  repository       = "https://kubernetes.github.io/ingress-nginx"
+  chart            = "ingress-nginx"
+  version          = "4.11.3"
 
-  set {
-    name  = "controller.service.type"
-    value = "LoadBalancer"
-  }
-  set {
-    name  = "controller.service.annotations.service\\.beta\\.kubernetes\\.io/aws-load-balancer-type"
-    value = "nlb"
-  }
+  values = [yamlencode({
+    controller = {
+      service = {
+        type = "LoadBalancer"
+        annotations = {
+          "service.beta.kubernetes.io/aws-load-balancer-type" = "nlb"
+        }
+      }
+      admissionWebhooks = { enabled = false }
+    }
+  })]
 }
 
 # ============================================================================
-# RabbitMQ via Helm (namespace messaging)
+# Namespaces
 # ============================================================================
-resource "kubernetes_namespace" "messaging" {
+resource "kubernetes_namespace" "oficina" {
   depends_on = [aws_eks_node_group.main]
-  metadata {
-    name = "messaging"
-  }
+  metadata { name = "oficina" }
 }
 
-resource "helm_release" "rabbitmq" {
-  depends_on = [kubernetes_namespace.messaging]
-  name       = "rabbitmq"
-  namespace  = "messaging"
-  repository = "https://charts.bitnami.com/bitnami"
-  chart      = "rabbitmq"
-  version    = "14.6.6"
-
-  set { name = "auth.username"; value = "guest" }
-  set { name = "auth.password"; value = "guest" }
-  set { name = "persistence.size"; value = "1Gi" }
-  set { name = "replicaCount"; value = "1" }
-  set { name = "metrics.enabled"; value = "true" }
-}
-
-# ============================================================================
-# MongoDB via Helm (namespace data)
-# ============================================================================
 resource "kubernetes_namespace" "data" {
   depends_on = [aws_eks_node_group.main]
-  metadata {
-    name = "data"
-  }
+  metadata { name = "data" }
 }
 
-resource "helm_release" "mongodb" {
-  depends_on = [kubernetes_namespace.data]
-  name       = "mongodb"
-  namespace  = "data"
-  repository = "https://charts.bitnami.com/bitnami"
-  chart      = "mongodb"
-  version    = "16.4.5"
+resource "kubernetes_namespace" "messaging" {
+  depends_on = [aws_eks_node_group.main]
+  metadata { name = "messaging" }
+}
 
-  set { name = "auth.rootUser"; value = "execution" }
-  set { name = "auth.rootPassword"; value = "execution" }
-  set { name = "auth.databases[0]"; value = "execution_db" }
-  set { name = "persistence.size"; value = "1Gi" }
-  set { name = "architecture"; value = "standalone" }
+# ============================================================================
+# MongoDB + RabbitMQ — aplicados via kubectl após cluster estar pronto
+# (kubernetes_manifest do TF exige cluster existente em plan time)
+# ============================================================================
+resource "null_resource" "infra_manifests" {
+  depends_on = [
+    aws_eks_node_group.main,
+    kubernetes_namespace.data,
+    kubernetes_namespace.messaging,
+    helm_release.nginx_ingress,
+  ]
+
+  triggers = {
+    manifest_hash = filesha256("${path.module}/../k8s/infra-stack.yaml")
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws eks update-kubeconfig --name ${aws_eks_cluster.main.name} --region ${var.region} --kubeconfig /tmp/kubeconfig-fase4
+      KUBECONFIG=/tmp/kubeconfig-fase4 kubectl apply -f ${path.module}/../k8s/infra-stack.yaml
+    EOT
+  }
 }
 
 # ============================================================================
